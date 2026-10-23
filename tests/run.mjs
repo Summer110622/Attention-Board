@@ -241,7 +241,7 @@ test('all block names, descriptions, field labels, categories and templates are 
   });
   PALETTE.forEach((g) => need.push('cat.' + g.cat));
   TEMPLATES.forEach((tp) => need.push('tpl.' + tp.id));
-  ['B', 'T', 'D', 'H', 'Hkv'].forEach((k) => need.push('cfg.' + k));
+  ['B', 'T', 'D', 'H', 'Hkv', 'Dh'].forEach((k) => need.push('cfg.' + k));
   const en = new Set(EN_KEYS), ja = new Set(JA_KEYS);
   need.forEach((k) => { assert.ok(en.has(k), 'EN missing ' + k); if (k !== 'f.k_topk') assert.ok(ja.has(k), 'JA missing ' + k); });
 });
@@ -278,6 +278,120 @@ test('sanitizeProgram rejects unknown blocks and repairs bad values', () => {
   assert.equal(p.config.D, 512); assert.equal(p.config.T, 64);
   assert.equal(p.blocks[0].params.rank, 64);
   assert.notEqual(p.blocks[0].id, p.blocks[1].id);
+});
+
+// ---------------------------------------------------------------------------
+// Kimi-K3-style config: MLA + hybrid linear/full attention + dense first layer + MoE
+// ---------------------------------------------------------------------------
+const K3_FULL = [...Array.from({ length: 23 }, (_, i) => 4 * (i + 1)), 93];
+const K3_KDA = Array.from({ length: 93 }, (_, i) => i + 1).filter((i) => !K3_FULL.includes(i));
+const KIMI_K3 = {
+  architectures: ['KimiK3ForConditionalGeneration'], model_type: 'kimi_k3',
+  text_config: {
+    model_type: 'kimi_k3', hidden_size: 7168, num_hidden_layers: 93, num_attention_heads: 96, num_key_value_heads: 96,
+    vocab_size: 163840, max_position_embeddings: 1048576,
+    kv_lora_rank: 512, q_lora_rank: 1536, qk_nope_head_dim: 128, qk_rope_head_dim: 64, v_head_dim: 128,
+    num_experts: 896, num_experts_per_token: 16, num_shared_experts: 2, moe_intermediate_size: 3072,
+    first_k_dense_replace: 1, moe_layer_freq: 1, hidden_act: 'situ', rms_norm_eps: 1e-5,
+    linear_attn_config: { kda_layers: K3_KDA, full_attn_layers: K3_FULL, num_heads: 96, head_dim: 128, short_conv_kernel_size: 4 }
+  }
+};
+
+test('Kimi-K3 config: MLA, 69 linear + 24 full layers, dense first layer, top-16 experts', () => {
+  assert.equal(K3_FULL.length, 24); assert.equal(K3_KDA.length, 69);
+  const s = configToSpec(KIMI_K3, 'moonshotai/Kimi-K3');
+  assert.equal(s.hidden, 7168); assert.equal(s.layers, 93);
+  assert.equal(s.attnKind, 'MLA'); assert.equal(s.headDim, 192);
+  assert.deepEqual(s.mla, { kvLoraRank: 512, qLoraRank: 1536, qkNope: 128, qkRope: 64, vHead: 128 });
+  assert.equal(s.hybrid.linear, 69); assert.equal(s.hybrid.full, 24); assert.equal(s.hybrid.linearName, 'KDA');
+  assert.equal(s.hybrid.kinds[3], 'full'); assert.equal(s.hybrid.kinds[0], 'linear'); assert.equal(s.hybrid.kinds[92], 'full');
+  assert.equal(s.ffnType, 'moe'); assert.equal(s.experts, 896); assert.equal(s.topK, 16); assert.equal(s.shared, 2);
+  assert.equal(s.denseLayers, 1); assert.equal(s.denseFfn, null);
+  assert.equal(s.pos, 'rope'); assert.equal(s.ropeTheta, null);
+  assert.equal(s.params, null, 'no estimate when linear-attention layers are not modelled');
+  assert.ok(s.notes.some((n) => n.key === 'hf.note.linear'));
+  assert.ok(s.notes.some((n) => n.key === 'hf.note.act'), 'unknown activation is flagged');
+});
+test('Kimi-K3 program: d_model = hidden_size, MLA block, no analysis errors', () => {
+  const p = specToProgram(configToSpec(KIMI_K3, 'k3'));
+  assert.equal(p.config.D, 7168); assert.equal(p.config.H, 96); assert.equal(p.config.Dh, 192);
+  assert.ok(p.blocks.some((b) => b.type === 'mla'));
+  const a = analyze(p);
+  assert.deepEqual(a.errors, [], JSON.stringify(a.errors));
+  const q = a.tensors.find((x) => x.name === 'q'), v = a.tensors.find((x) => x.name === 'v'), y = a.tensors.find((x) => x.name === 'y');
+  assert.deepEqual(q.shape, ['B', 'H', 'T', 192]); assert.deepEqual(v.shape, ['B', 'H', 'T', 128]); assert.deepEqual(y.shape, ['B', 'T', 'D']);
+  // o_proj maps H * d_v = 12288 -> 7168
+  const o = a.perBlock[p.blocks.find((b) => b.type === 'outproj').id];
+  assert.equal(o.params, 96 * 128 * 7168);
+});
+test('MLA program: PyTorch code uses low-rank q/kv, decoupled RoPE and sqrt(192) scaling', () => {
+  const p = specToProgram(configToSpec(KIMI_K3, 'k3'));
+  const code = generateCode(p, analyze(p)).text;
+  assert.match(code, /nn\.Linear\(d_model, 1536/); assert.match(code, /nn\.Linear\(d_model, 512 \+ 64/);
+  assert.match(code, /apply_rope\(q_pe/); assert.match(code, /math\.sqrt\(192\)/);
+  assert.match(code, /nn\.Linear\(n_heads \* 128, d_model/); assert.match(code, /head_dim=192/);
+  assert.match(code, /class RMSNorm/);
+});
+test('MLA program evaluates numerically with finite, row-normalised attention', () => {
+  const p = specToProgram(configToSpec(KIMI_K3, 'k3'));
+  const a = analyze(p);
+  const r = evaluate(p, a);
+  assert.equal(r.stopped, null);
+  const nb = p.blocks.find((b) => b.type === 'norm');
+  const att = r.outputs[nb.id];
+  assert.ok(att.data.every(Number.isFinite));
+  const T = att.shape[1];
+  let sum = 0; for (let j = 0; j < T; j++) sum += att.data[(T - 1) * T + j];
+  assert.ok(Math.abs(sum - 1) < 1e-4);
+});
+test('head_dim x heads != hidden_size keeps D = hidden_size', () => {
+  const s = configToSpec({ model_type: 'llama', hidden_size: 2560, num_attention_heads: 32, head_dim: 128, num_hidden_layers: 4, intermediate_size: 9728, rms_norm_eps: 1e-6, hidden_act: 'silu', vocab_size: 1000 }, 'q');
+  const p = specToProgram(s);
+  assert.equal(p.config.D, 2560); assert.equal(p.config.Dh, 128);
+  assert.deepEqual(analyze(p).errors, []);
+  assert.ok(s.notes.some((n) => n.key === 'hf.dimnote'));
+  assert.match(generateCode(p, analyze(p)).text, /head_dim=128/);
+});
+test('unreadable keys are reported as unknown instead of guessed', () => {
+  const s = configToSpec({ model_type: 'mystery', hidden_size: 512, num_hidden_layers: 2, num_attention_heads: 8 }, 'm');
+  assert.equal(s.pos, 'unknown'); assert.equal(s.norm, 'unknown'); assert.equal(s.ffn, null);
+  assert.deepEqual(s.unknown.sort(), ['ffn', 'norm', 'pos']);
+  assert.equal(s.params, null);
+  const svg = modelDiagram(s).svg;
+  assert.match(svg, /unknown/);
+  const moe = configToSpec({ model_type: 'llama', hidden_size: 512, num_hidden_layers: 2, num_attention_heads: 8, num_local_experts: 4, intermediate_size: 64, rms_norm_eps: 1e-6 }, 'e');
+  assert.ok(moe.unknown.includes('topk'));
+});
+test('num_experts_per_token alias is read', () => {
+  const s = configToSpec({ model_type: 'llama', hidden_size: 512, num_hidden_layers: 2, num_attention_heads: 8, num_experts: 8, num_experts_per_token: 3, intermediate_size: 64, rms_norm_eps: 1e-6 }, 'e');
+  assert.equal(s.topK, 3);
+});
+test('model figure labels hybrid layers, MLA and the dense first layer', () => {
+  const svg = modelDiagram(configToSpec(KIMI_K3, 'moonshotai/Kimi-K3')).svg;
+  assert.ok(svg.startsWith('<svg') && svg.includes('</svg>'));
+  assert.match(svg, /69 × KDA/); assert.match(svg, /24 × full attention \(MLA\)/); assert.match(svg, /r_q=1536, r_kv=512/);
+  assert.match(svg, /d_nope=128, d_rope=64, d_v=128/); assert.match(svg, /top-16/); assert.match(svg, /first 1 layer: dense FFN/);
+  assert.match(svg, /d_model=7,168/); assert.doesNotMatch(svg, /18,432/);
+  assert.match(svg, /Layers are not identical/);
+});
+test('MLA attention-block figure shows low-rank, latent KV and decoupled RoPE nodes', () => {
+  const p = specToProgram(configToSpec(KIMI_K3, 'k3'));
+  const svg = attentionDiagram(p, analyze(p)).svg;
+  assert.match(svg, /Latent KV Linear/); assert.match(svg, /Decoupled RoPE/); assert.match(svg, /1\/√192/); assert.match(svg, /d_model=7168/); assert.match(svg, /d_h=192/);
+  assert.ok(svg.indexOf('NaN') < 0);
+});
+test('MLA block shape errors are reported', () => {
+  const p = makeProgram('x', { D: 64, H: 4, Hkv: 4 }, [newBlock('input'), newBlock('mla', { rope: 3 }), newBlock('score', { q: 'q', k: 'k' })]);
+  const a = analyze(p);
+  assert.ok(a.errors.some((e) => e.key === 'err.rope_even'));
+  const bad = makeProgram('x', { D: 64, H: 4, Hkv: 4 }, [newBlock('input'), newBlock('mla', { nope: 8, rope: 4 }), newBlock('proj', { src: 'x', out: 'k2' }), newBlock('score', { q: 'q', k: 'k2' })]);
+  assert.ok(analyze(bad).errors.some((e) => e.key === 'err.dim_mismatch'));
+});
+test('Dh config survives share links and sanitize', () => {
+  const p = specToProgram(configToSpec(KIMI_K3, 'k3'));
+  const q = decodeShare(encodeShare(p));
+  assert.equal(q.config.Dh, 192); assert.equal(q.config.D, 7168);
+  assert.equal(sanitizeProgram({ blocks: [], config: { Dh: -5 } }).config.Dh, 0);
 });
 
 console.log('\n' + passed + ' passed' + (process.exitCode ? ', with failures' : ''));

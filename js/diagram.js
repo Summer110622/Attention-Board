@@ -72,13 +72,31 @@ export function attentionDiagram(program, analysis, opts = {}) {
         const n = add(p.kind === 'lowrank' ? 'Low-rank Linear' : 'Linear', 'W_' + p.out + (p.kind === 'lowrank' ? ', r=' + p.rank : ''), FILL.linear);
         link(p.src, n); setProd(p.out, n, b.id); break;
       }
+      case 'mla': {
+        const dq = p.nope + p.rope;
+        const nq = add(p.qRank > 0 ? 'Low-rank Linear' : 'Linear', 'W_' + (p.qRank > 0 ? 'DQ,UQ, r_q=' + p.qRank : 'Q'), FILL.linear);
+        const nkv = add('Latent KV Linear', 'W_DKV,UKV, r_kv=' + p.kvRank, FILL.linear);
+        const nr = add('Decoupled RoPE', 'd_r=' + p.rope + ', θ=' + p.base, FILL.rope);
+        const nc = add('Concat', 'nope ‖ rope, d_h=' + dq, FILL.concat);
+        link(p.src, nq); link(p.src, nkv); link(p.src, nr);
+        [nq, nkv, nr].forEach((n) => {
+          edges.push({ from: n.id, to: nc.id, name: n === nq ? 'q' : n === nkv ? 'c_kv' : 'rope', shape: '' }); nc.parents.push(n.id);
+        });
+        setProd(p.outQ, nc, b.id); setProd(p.outK, nc, b.id); setProd(p.outV, nkv, b.id);
+        const info = analysis.perBlock[b.id];
+        if (info && info.outs && info.outs.length === 3) {
+          [p.outQ, p.outK, p.outV].forEach((nm, i) => { prod.get(nm).shape = '[' + info.outs[i].shape.join(', ') + ']'; });
+        }
+        break;
+      }
       case 'rope': { const n = add('RoPE', 'θ=' + p.base, FILL.rope); link(p.target, n); setProd(p.target, n, b.id); break; }
       case 'score': {
         const n1 = add(p.kind === 'cosine' ? 'Cosine Sim.' : 'MatMul', up(p.q) + up(p.k) + 'ᵀ', FILL.matmul);
         link(p.q, n1); link(p.k, n1);
         let last = n1;
         if (p.scale === 'sqrt') {
-          last = add('Scale', '1/√d_h', FILL.scale);
+          const qs = analysis.perBlock[b.id] && analysis.perBlock[b.id].ins[0] ? analysis.perBlock[b.id].ins[0].shape[3] : 'Dh';
+          last = add('Scale', typeof qs === 'number' ? '1/√' + qs : '1/√d_h', FILL.scale);
           edges.push({ from: n1.id, to: last.id, name: p.out, shape: analysis.perBlock[b.id].out ? '[' + analysis.perBlock[b.id].out.shape.join(', ') + ']' : '' });
           last.parents.push(n1.id);
         }
@@ -142,14 +160,15 @@ export function attentionDiagram(program, analysis, opts = {}) {
   const margin = 44;
   const capLines = [
     'Figure. ' + (opts.title || program.name || 'Attention block'),
-    'B=' + program.config.B + ', T=' + program.config.T + ', d_model=' + program.config.D + ', h=' + program.config.H + (program.config.Hkv !== program.config.H ? ', h_kv=' + program.config.Hkv : '')
+    'B=' + program.config.B + ', T=' + program.config.T + ', d_model=' + program.config.D + ', h=' + program.config.H + (program.config.Hkv !== program.config.H ? ', h_kv=' + program.config.Hkv : '') + (program.config.Dh > 0 ? ', d_h=' + program.config.Dh : '')
   ];
+  if (opts.subtitle) capLines.push(opts.subtitle);
   const capW = Math.max(...capLines.map((l, i) => estimateTextWidth(l, i ? 13 : 15))) + 40;
   const bodyW = maxX - minX;
   const width = Math.max(bodyW + margin * 2, capW, 420);
   const offX = (width - bodyW) / 2 - minX;
   const bodyH = maxLayer * VGAP + HOP;
-  const height = bodyH + margin * 2 + 54;
+  const height = bodyH + margin * 2 + 14 + capLines.length * 20;
   const baseCy = margin + bodyH - HOP / 2;
   const cyOf = (n) => baseCy - layer[n.id] * VGAP;
   const hOf = (n) => (n.kind === 'term' ? HTERM : HOP);
@@ -188,7 +207,12 @@ export function attentionDiagram(program, analysis, opts = {}) {
       const d = (sy - ty) / 2;
       out += '<path d="M' + num(sx) + ',' + num(sy) + ' C' + num(sx) + ',' + num(sy - d) + ' ' + num(tx) + ',' + num(ty + d) + ' ' + num(tx) + ',' + num(ty) + '" fill="none" stroke="' + INK + '" stroke-width="1.3" marker-end="url(#ah)"/>';
       if (showShapes) {
-        if (Math.abs(sx - tx) < 8) out += text((sx + tx) / 2 + 7, (sy + ty) / 2 + 4, label, { size: 11, italic: true, anchor: 'start' });
+        if (Math.abs(sx - tx) < 8) {
+          // Several edges between the same pair of nodes: put their labels on opposite sides so they do not collide.
+          const shared = ins.get(e.to).length > 1 || outs.get(e.from).length > 1;
+          const left = shared && (e.tOff || 0) < 0;
+          out += text((sx + tx) / 2 + (left ? -7 : 7), (sy + ty) / 2 + 4, label, { size: 11, italic: true, anchor: left ? 'end' : 'start' });
+        }
         else out += labelBox((sx + tx) / 2, (sy + ty) / 2 + 3, label);
       }
     }
@@ -199,7 +223,7 @@ export function attentionDiagram(program, analysis, opts = {}) {
     if (n.sub) { out += text(cx, cy - 3, n.label, { size: 15 }) + text(cx, cy + 13, n.sub, { size: 12, italic: true, fill: '#333' }); }
     else out += text(cx, cy + 5, n.label, { size: n.kind === 'term' ? 15 : 16, italic: n.kind === 'term' });
   });
-  out += captionBlock(width / 2, height - 36, capLines);
+  out += captionBlock(width / 2, height - 16 - (capLines.length - 1) * 20, capLines);
   return { svg: svgWrap(width, height, out), width, height };
 }
 
@@ -278,33 +302,74 @@ const mlpAct = (a) => {
   if (/silu|swish/.test(s)) return 'SiLU';
   return a;
 };
+const UNKNOWN_EN = { pos: 'positional scheme', norm: 'normalisation type', topk: 'experts per token', ffn: 'FFN width', mla_dims: 'MLA head dims' };
 const fmtN = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
-const normName = (s) => (s.norm === 'rms' ? 'RMSNorm' : 'LayerNorm');
+const normName = (s) => (s.norm === 'rms' ? 'RMSNorm' : s.norm === 'layer' ? 'LayerNorm' : 'Norm (unknown type)');
+
+// "4, 8, 12, …, 92, 93" style summary of the 1-based indices of layers of one kind.
+function layerList(kinds, kind) {
+  const idx = kinds.map((k, i) => (k === kind ? i + 1 : null)).filter((x) => x !== null);
+  if (idx.length <= 7) return idx.join(', ');
+  return idx.slice(0, 3).join(', ') + ', …, ' + idx.slice(-2).join(', ');
+}
+
+function mlaSubs(s) {
+  const m = s.mla;
+  const subs = ['r_q=' + (m.qLoraRank || '—') + ', r_kv=' + m.kvLoraRank + ', h=' + s.heads];
+  subs.push(m.qkNope != null && m.qkRope != null ? 'd_nope=' + m.qkNope + ', d_rope=' + m.qkRope + ', d_v=' + (m.vHead == null ? '?' : m.vHead) : 'head dims: unknown');
+  return subs;
+}
+
+function hybridAttnBox(s) {
+  const hy = s.hybrid;
+  const subs = [];
+  const fullName = s.attnKind === 'MLA' ? 'MLA' : s.attnKind === 'MHA' ? 'MHA' : s.attnKind;
+  if (hy.linear) subs.push(hy.linear + ' × ' + hy.linearName + ' (linear attention)');
+  if (hy.sliding) subs.push(hy.sliding + ' × sliding-window' + (hy.window ? ' (' + fmtN(hy.window) + ')' : '') + ' attention');
+  if (hy.full) subs.push(hy.full + ' × full attention (' + fullName + ')');
+  if (hy.other) subs.push(hy.other + ' × unspecified layer type');
+  if (hy.full) subs.push('full-attn layers: ' + layerList(hy.kinds, 'full'));
+  if (s.mla) subs.push(...mlaSubs(s)); else subs.push('h=' + s.heads + (s.kvHeads !== s.heads ? ', h_kv=' + s.kvHeads : '') + ', d_h=' + Math.round(s.headDim));
+  const extra = posLabel(s);
+  if (extra) subs.push(extra);
+  return { t: 'box', text: 'Hybrid Attention (per-layer type)', subs, fill: FILL.attn };
+}
+
+function posLabel(s) {
+  if (s.pos === 'rope') return 'RoPE' + (s.ropeTheta ? ' θ=' + fmtN(s.ropeTheta) : '') + (s.mla ? ' (decoupled)' : '');
+  if (s.pos === 'alibi') return 'ALiBi';
+  if (s.pos === 'relative') return 'relative pos. bias';
+  if (s.pos === 'unknown') return 'positional scheme: unknown';
+  return '';
+}
 
 function attnBox(s, { causal, cross = false }) {
+  if (s.hybrid && !cross) return hybridAttnBox(s);
   const kind = s.attnKind;
   const kindName = kind === 'MHA' ? 'Multi-Head' : kind === 'MQA' ? 'Multi-Query' : kind === 'GQA' ? 'Grouped-Query' : 'Multi-head Latent';
   const title = (cross ? 'Cross-' : causal ? 'Masked ' : '') + (cross ? 'Attention' : kindName + ' Attention');
   const subs = [];
-  if (kind === 'MLA') subs.push('MLA, d_c=' + s.mla.kvLoraRank + ', h=' + s.heads);
+  if (kind === 'MLA') subs.push(...mlaSubs(s));
   else subs.push('h=' + s.heads + (kind === 'GQA' || kind === 'MQA' ? ', h_kv=' + s.kvHeads : '') + ', d_h=' + Math.round(s.headDim));
   if (!cross) {
     const extra = [];
-    if (s.pos === 'rope') extra.push('RoPE' + (s.ropeTheta ? ' θ=' + fmtN(s.ropeTheta) : ''));
-    if (s.pos === 'alibi') extra.push('ALiBi');
-    if (s.pos === 'relative') extra.push('relative pos. bias');
+    const pl = posLabel(s);
+    if (pl && s.pos !== 'learned') extra.push(pl);
     if (s.window) extra.push('window=' + fmtN(s.window));
     if (extra.length) subs.push(extra.join(', '));
   }
   return { t: 'box', text: title, subs, fill: cross ? FILL.cross : FILL.attn };
 }
 
+const dff = (n) => (n == null ? 'unknown' : fmtN(n));
 function ffnBox(s) {
   if (s.ffnType === 'moe') {
-    return { t: 'box', text: 'Mixture of Experts', subs: ['E=' + s.experts + (s.topK ? ', top-' + s.topK : '') + (s.shared ? ', shared=' + s.shared : ''), 'd_ff=' + fmtN(s.ffn) + ' / expert'], fill: FILL.moe };
+    const subs = ['E=' + s.experts + ', top-' + (s.topK || '?') + (s.shared ? ', shared=' + s.shared : ''), 'd_ff=' + dff(s.ffn) + ' / expert'];
+    if (s.denseLayers > 0) subs.push('first ' + s.denseLayers + ' layer' + (s.denseLayers > 1 ? 's' : '') + ': dense FFN' + (s.denseFfn ? ' (d_ff=' + fmtN(s.denseFfn) + ')' : ''));
+    return { t: 'box', text: 'Mixture of Experts', subs, fill: FILL.moe };
   }
-  if (s.ffnType === 'gated') return { t: 'box', text: act(s.act) + ' Feed-Forward', subs: ['d_ff=' + fmtN(s.ffn)], fill: FILL.ffn };
-  return { t: 'box', text: 'Feed-Forward', subs: [mlpAct(s.act) + ', d_ff=' + fmtN(s.ffn)], fill: FILL.ffn };
+  if (s.ffnType === 'gated') return { t: 'box', text: act(s.act) + ' Feed-Forward', subs: ['d_ff=' + dff(s.ffn)], fill: FILL.ffn };
+  return { t: 'box', text: 'Feed-Forward', subs: [mlpAct(s.act) + ', d_ff=' + dff(s.ffn)], fill: FILL.ffn };
 }
 
 function sublayer(s, box, anchorId) {
@@ -330,6 +395,7 @@ function headFor(s) {
 function embedBox(s) {
   const learned = s.pos === 'learned';
   const subs = [(s.vocab ? 'V=' + fmtN(s.vocab) + ', ' : '') + 'd=' + fmtN(s.hidden)];
+  if (s.pos === 'unknown') subs.push('positional scheme: unknown');
   return { t: 'box', text: learned ? 'Token + Position Embedding' : 'Token Embedding', subs, fill: FILL.embed };
 }
 
@@ -354,9 +420,18 @@ export function modelDiagram(spec) {
   const capLines = [
     'Figure. Architecture of ' + s.name + ' (' + famLabel + ' Transformer).',
     layersTxt + ', d_model=' + fmtN(s.hidden) + ', h=' + s.heads + (s.attnKind === 'GQA' || s.attnKind === 'MQA' ? ', h_kv=' + s.kvHeads : '') +
-      (s.ffnType === 'moe' ? ', E=' + s.experts : ', d_ff=' + fmtN(s.ffn)) + (s.vocab ? ', V=' + fmtN(s.vocab) : '') + (s.params ? ', ≈' + formatParamsShort(s.params) + ' params' : '')
+      (s.ffnType === 'moe' ? ', E=' + s.experts + (s.topK ? ', top-' + s.topK : '') : ', d_ff=' + dff(s.ffn)) + (s.vocab ? ', V=' + fmtN(s.vocab) : '') + (s.params ? ', ≈' + formatParamsShort(s.params) + ' params' : '')
   ];
+  if (s.hybrid) {
+    const hy = s.hybrid, parts = [];
+    if (hy.linear) parts.push(hy.linear + ' ' + hy.linearName + ' (linear)');
+    if (hy.sliding) parts.push(hy.sliding + ' sliding-window');
+    if (hy.full) parts.push(hy.full + ' full-attention' + (s.mla ? ' (MLA)' : ''));
+    capLines.push('Layers are not identical: ' + parts.join(' + ') + (s.denseLayers ? '; first ' + s.denseLayers + ' FFN layer(s) dense' : '') + '. The repeated block is drawn once.');
+  } else if (s.denseLayers) capLines.push('First ' + s.denseLayers + ' layer(s) use a dense FFN; the remaining layers are MoE.');
   if (s.multimodal) capLines.push('Text backbone of a multimodal model (' + s.multimodal + ').');
+  (s.notes || []).filter((n) => n.key !== 'hf.dimnote').forEach((n) => capLines.push('Note: ' + n.en));
+  if ((s.unknown || []).length) capLines.push('Not read from config.json (shown as unknown): ' + s.unknown.map((u) => UNKNOWN_EN[u] || u).join(', ') + '.');
   const ncol = s.family === 'encdec' ? 2 : 1;
   const bodyW = ncol * BW + (ncol - 1) * 190 + 140;
   const capW = Math.max(...capLines.map((l, i) => estimateTextWidth(l, i ? 13 : 15))) + 40;
@@ -367,7 +442,7 @@ export function modelDiagram(spec) {
   if (s.family === 'encdec') {
     const encSeq = [{ t: 'term', text: 'Inputs' }, embedBox(s), { t: 'frameStart', text: s.encLayers + '×' }, ...sublayer(s, attnBox(s, { causal: false })), ...sublayer(s, ffnBox(s)), { t: 'frameEnd' }];
     if (s.placement === 'pre') encSeq.push({ t: 'box', text: 'Final ' + normName(s), fill: FILL.norm });
-    const decHead = [{ t: 'box', text: 'Linear', subs: [s.tie ? 'tied with embedding' : 'LM head'], fill: FILL.head }, { t: 'box', text: 'Softmax', fill: FILL.softmax }, { t: 'term', text: 'Output probabilities' }];
+    const decHead = [{ t: 'box', text: 'Linear', subs: [s.tie === true ? 'tied with embedding' : 'LM head'], fill: FILL.head }, { t: 'box', text: 'Softmax', fill: FILL.softmax }, { t: 'term', text: 'Output probabilities' }];
     const decSeq = decoderSeq(s, { cross: true, layers: s.decLayers, inputLabel: 'Outputs (shifted right)', finalHead: decHead, causal: true });
     cols = [buildColumn(encSeq, colX(0)), buildColumn(decSeq, colX(1))];
     crossLink = true;
@@ -377,7 +452,7 @@ export function modelDiagram(spec) {
     seq.push(...headFor(s));
     cols = [buildColumn(seq, colX(0))];
   } else {
-    const head = [{ t: 'box', text: 'Linear', subs: [s.tie ? 'LM head, tied with embedding' : 'LM head'], fill: FILL.head }, { t: 'box', text: 'Softmax', fill: FILL.softmax }, { t: 'term', text: 'Output probabilities' }];
+    const head = [{ t: 'box', text: 'Linear', subs: [s.tie === true ? 'LM head, tied with embedding' : 'LM head'], fill: FILL.head }, { t: 'box', text: 'Softmax', fill: FILL.softmax }, { t: 'term', text: 'Output probabilities' }];
     cols = [buildColumn(decoderSeq(s, { cross: false, layers: s.layers, inputLabel: 'Input token ids', finalHead: head, causal: true }), colX(0))];
   }
 
