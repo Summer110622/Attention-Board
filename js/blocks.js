@@ -1,7 +1,10 @@
 // Block registry, symbolic shape checking and PyTorch code generation.
 // Pure logic: no DOM access, so it can be unit-tested with Node.
 
-export const DEFAULT_CONFIG = { B: 2, T: 128, D: 512, H: 8, Hkv: 8 };
+// Dh = 0 means "derive from D / H". Set it explicitly for models whose head_dim * H != hidden_size.
+export const DEFAULT_CONFIG = { B: 2, T: 128, D: 512, H: 8, Hkv: 8, Dh: 0 };
+
+export const effDh = (cfg) => (cfg.Dh > 0 ? cfg.Dh : cfg.D / cfg.H);
 
 export const CATEGORIES = {
   input:   { color: '#2F6FDE', tint: '#E8F0FD' },
@@ -19,7 +22,7 @@ export { fmtShape };
 
 export function dimValue(sym, cfg) {
   if (typeof sym === 'number') return sym;
-  if (sym === 'Dh') return cfg.D / cfg.H;
+  if (sym === 'Dh') return effDh(cfg);
   return cfg[sym];
 }
 
@@ -57,7 +60,7 @@ export const BLOCKS = {
       const { D, H, Hkv } = ctx.cfg;
       if (hs === 'Hkv' && H % Hkv !== 0) ctx.err('err.gqa', { H, Hkv });
       const heads = dimValue(hs, ctx.cfg);
-      const dh = D / H;
+      const dh = effDh(ctx.cfg);
       const params = p.kind === 'lowrank' ? D * p.rank + p.rank * heads * dh : D * heads * dh;
       return { out: { name: p.out, shape: ['B', hs, 'T', 'Dh'] }, params, cost: 'O(B·T·D·' + hs + '·Dh)' };
     }
@@ -69,8 +72,8 @@ export const BLOCKS = {
     parts: (p) => [['rotate', 0], [p.target, 1], ['(RoPE)', 0]],
     check(p, ctx) {
       const s = ctx.need(p.target);
-      if (s && !(s.length === 4 && s[3] === 'Dh')) ctx.err('err.shape', { expect: '[B, H, T, Dh]', got: fmtShape(s) });
-      if ((ctx.cfg.D / ctx.cfg.H) % 2 !== 0) ctx.err('err.rope_even', {});
+      if (s && s.length !== 4) ctx.err('err.shape', { expect: '[B, H, T, Dh]', got: fmtShape(s) });
+      if (s && s.length === 4 && dimValue(s[3], ctx.cfg) % 2 !== 0) ctx.err('err.rope_even', {});
       return { out: s ? { name: p.target, shape: s } : null, cost: 'O(B·H·T·Dh)' };
     }
   },
@@ -86,8 +89,9 @@ export const BLOCKS = {
     check(p, ctx) {
       const q = ctx.need(p.q), k = ctx.need(p.k);
       ctx.name(p.out);
-      if (q && !(q.length === 4 && q[1] === 'H' && q[3] === 'Dh')) ctx.err('err.shape', { expect: '[B, H, T, Dh]', got: fmtShape(q) });
-      if (k && !(k.length === 4 && (k[1] === 'H' || k[1] === 'Hkv') && k[3] === 'Dh')) ctx.err('err.shape', { expect: '[B, H|Hkv, T, Dh]', got: fmtShape(k) });
+      if (q && !(q.length === 4 && q[1] === 'H')) ctx.err('err.shape', { expect: '[B, H, T, Dh]', got: fmtShape(q) });
+      if (k && !(k.length === 4 && (k[1] === 'H' || k[1] === 'Hkv'))) ctx.err('err.shape', { expect: '[B, H|Hkv, T, Dh]', got: fmtShape(k) });
+      if (q && k && q.length === 4 && k.length === 4 && q[3] !== k[3]) ctx.err('err.dim_mismatch', { a: q[3], b: k[3] });
       return { out: { name: p.out, shape: ['B', 'H', 'T', 'T'] }, cost: 'O(B·H·T²·Dh)' };
     }
   },
@@ -149,7 +153,39 @@ export const BLOCKS = {
       ctx.name(p.out);
       if (a && !(a.length === 4 && a[2] === 'T' && a[3] === 'T')) ctx.err('err.shape', { expect: '[B, H, T, T]', got: fmtShape(a) });
       if (v && !(v.length === 4 && (v[1] === 'H' || v[1] === 'Hkv') && v[2] === 'T')) ctx.err('err.shape', { expect: '[B, H|Hkv, T, Dh]', got: fmtShape(v) });
-      return { out: { name: p.out, shape: ['B', 'H', 'T', 'Dh'] }, cost: 'O(B·H·T²·Dh)' };
+      return { out: { name: p.out, shape: ['B', 'H', 'T', v && v.length === 4 ? v[3] : 'Dh'] }, cost: 'O(B·H·T²·Dh)' };
+    }
+  },
+  mla: {
+    cat: 'project',
+    defaults: () => ({ src: 'x', outQ: 'q', outK: 'k', outV: 'v', qRank: 1536, kvRank: 512, nope: 128, rope: 64, vDim: 128, base: 10000 }),
+    fields: [
+      { key: 'src', kind: 'tensor' },
+      { key: 'outQ', kind: 'text' }, { key: 'outK', kind: 'text' }, { key: 'outV', kind: 'text' },
+      { key: 'qRank', kind: 'number', min: 0, step: 1 }, { key: 'kvRank', kind: 'number', min: 1, step: 1 },
+      { key: 'nope', kind: 'number', min: 1, step: 1 }, { key: 'rope', kind: 'number', min: 2, step: 2 },
+      { key: 'vDim', kind: 'number', min: 1, step: 1 }, { key: 'base', kind: 'number', min: 1 }
+    ],
+    parts: (p) => [[p.outQ.toUpperCase() + ', ' + p.outK.toUpperCase() + ', ' + p.outV.toUpperCase() + ' =', 0], ['MLA', 1], ['(', 0], [p.src, 1], [')', 0]],
+    check(p, ctx) {
+      const s = ctx.need(p.src);
+      [p.outQ, p.outK, p.outV].forEach((n) => ctx.name(n));
+      if (s && !(s.length === 3 && s[2] === 'D')) ctx.err('err.shape', { expect: '[B, T, D]', got: fmtShape(s) });
+      ['kvRank', 'nope', 'rope', 'vDim'].forEach((f) => { if (!(p[f] >= 1)) ctx.err('err.positive', { field: f }); });
+      if (!(p.qRank >= 0)) ctx.err('err.positive', { field: 'qRank' });
+      if (p.rope % 2 !== 0) ctx.err('err.rope_even', {});
+      const { D, H } = ctx.cfg;
+      const dq = p.nope + p.rope;
+      const qParams = p.qRank > 0 ? D * p.qRank + p.qRank * H * dq : D * H * dq;
+      const kvParams = D * (p.kvRank + p.rope) + p.kvRank * H * (p.nope + p.vDim);
+      return {
+        outs: [
+          { name: p.outQ, shape: ['B', 'H', 'T', dq] },
+          { name: p.outK, shape: ['B', 'H', 'T', dq] },
+          { name: p.outV, shape: ['B', 'H', 'T', p.vDim] }
+        ],
+        params: qParams + kvParams, cost: 'O(B·T·D·(r_q+r_kv))'
+      };
     }
   },
   outproj: {
@@ -160,8 +196,9 @@ export const BLOCKS = {
     check(p, ctx) {
       const o = ctx.need(p.src);
       ctx.name(p.out);
-      if (o && !(o.length === 4 && o[1] === 'H' && o[3] === 'Dh')) ctx.err('err.shape', { expect: '[B, H, T, Dh]', got: fmtShape(o) });
-      return { out: { name: p.out, shape: ['B', 'T', 'D'] }, params: ctx.cfg.D * ctx.cfg.D, cost: 'O(B·T·D²)' };
+      if (o && !(o.length === 4 && o[1] === 'H')) ctx.err('err.shape', { expect: '[B, H, T, Dh]', got: fmtShape(o) });
+      const inner = ctx.cfg.H * (o && o.length === 4 ? dimValue(o[3], ctx.cfg) : effDh(ctx.cfg));
+      return { out: { name: p.out, shape: ['B', 'T', 'D'] }, params: inner * ctx.cfg.D, cost: 'O(B·T·H·d·D)' };
     }
   },
   ret: {
@@ -203,7 +240,7 @@ export const BLOCKS = {
 
 export const PALETTE = [
   { cat: 'input', types: ['input', 'ret'] },
-  { cat: 'project', types: ['proj', 'rope', 'outproj'] },
+  { cat: 'project', types: ['proj', 'mla', 'rope', 'outproj'] },
   { cat: 'score', types: ['score'] },
   { cat: 'mask', types: ['mask'] },
   { cat: 'norm', types: ['norm', 'dropout'] },
@@ -235,12 +272,13 @@ export function analyze(program) {
   ['B', 'T', 'D', 'H', 'Hkv'].forEach((k) => {
     if (!(Number.isInteger(cfg[k]) && cfg[k] >= 1)) errors.push({ blockId: null, key: 'err.cfg_positive', args: { field: k } });
   });
-  if (Number.isInteger(cfg.D) && Number.isInteger(cfg.H) && cfg.H >= 1 && cfg.D % cfg.H !== 0) errors.push({ blockId: null, key: 'err.cfg_dh', args: { D: cfg.D, H: cfg.H } });
+  if (!(cfg.Dh === undefined || (Number.isInteger(cfg.Dh) && cfg.Dh >= 0))) errors.push({ blockId: null, key: 'err.cfg_positive', args: { field: 'Dh' } });
+  if (!(cfg.Dh > 0) && Number.isInteger(cfg.D) && Number.isInteger(cfg.H) && cfg.H >= 1 && cfg.D % cfg.H !== 0) errors.push({ blockId: null, key: 'err.cfg_dh', args: { D: cfg.D, H: cfg.H } });
   if (Number.isInteger(cfg.H) && Number.isInteger(cfg.Hkv) && cfg.Hkv >= 1 && cfg.H % cfg.Hkv !== 0) errors.push({ blockId: null, key: 'err.gqa', args: { H: cfg.H, Hkv: cfg.Hkv } });
 
   program.blocks.forEach((b) => {
     const def = BLOCKS[b.type];
-    const info = { ins: [], out: null, errors: [], cost: '—', params: 0, scope: Array.from(env.keys()) };
+    const info = { ins: [], out: null, outs: [], errors: [], cost: '—', params: 0, scope: Array.from(env.keys()) };
     const ctx = {
       cfg,
       need(name) {
@@ -253,11 +291,13 @@ export function analyze(program) {
       name(n) { if (!NAME_RE.test(String(n || ''))) info.errors.push({ key: 'err.badname', args: { name: n } }); }
     };
     const r = def.check(b.params, ctx) || {};
-    info.out = r.out || null;
+    const outs = r.outs || (r.out ? [r.out] : []);
+    info.outs = outs;
+    info.out = outs[0] || null;
     info.cost = r.cost || '—';
     info.params = r.params || 0;
     params += info.params;
-    if (info.out) { env.set(info.out.name, info.out.shape); tensors.push({ name: info.out.name, shape: info.out.shape, blockId: b.id }); }
+    outs.forEach((o) => { env.set(o.name, o.shape); tensors.push({ name: o.name, shape: o.shape, blockId: b.id }); });
     info.errors.forEach((e) => errors.push({ blockId: b.id, key: e.key, args: e.args }));
     perBlock[b.id] = info;
   });
@@ -294,6 +334,16 @@ const HELPERS = {
     '    x1, x2 = x[..., :half], x[..., half:]',
     '    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)'
   ],
+  rmsnorm: [
+    'class RMSNorm(nn.Module):',
+    '    def __init__(self, dim, eps=1e-6):',
+    '        super().__init__()',
+    '        self.weight = nn.Parameter(torch.ones(dim))',
+    '        self.eps = eps',
+    '',
+    '    def forward(self, x):',
+    '        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight'
+  ],
   causal_mask: [
     'def causal_mask(T, device):',
     '    return torch.ones(T, T, dtype=torch.bool, device=device).triu(1)'
@@ -319,7 +369,7 @@ const HELPERS = {
     '    return torch.clamp(x - tau, min=0)'
   ]
 };
-const HELPER_ORDER = ['repeat_kv', 'rope', 'causal_mask', 'sliding_mask', 'sparsemax'];
+const HELPER_ORDER = ['repeat_kv', 'rope', 'rmsnorm', 'causal_mask', 'sliding_mask', 'sparsemax'];
 
 export function generateCode(program, analysis) {
   const cfg = program.config;
@@ -358,6 +408,33 @@ export function generateCode(program, analysis) {
         add(p.out + ' = self.' + a + '(' + p.src + ').view(B, T, ' + hExpr(hs) + ', Dh).transpose(1, 2)' + shapeC(info));
         break;
       }
+      case 'mla': {
+        helpers.add('rope'); helpers.add('rmsnorm');
+        const id = b.id.slice(-3);
+        const dq = p.nope + p.rope;
+        if (p.qRank > 0) {
+          addInit('self.W_q_down_' + id + ' = nn.Linear(d_model, ' + p.qRank + ', bias=False)');
+          addInit('self.q_norm_' + id + ' = RMSNorm(' + p.qRank + ')');
+          addInit('self.W_q_up_' + id + ' = nn.Linear(' + p.qRank + ', n_heads * ' + dq + ', bias=False)');
+        } else {
+          addInit('self.W_q_' + id + ' = nn.Linear(d_model, n_heads * ' + dq + ', bias=False)');
+        }
+        addInit('self.W_kv_down_' + id + ' = nn.Linear(d_model, ' + p.kvRank + ' + ' + p.rope + ', bias=False)  # latent c_kv + shared RoPE key');
+        addInit('self.kv_norm_' + id + ' = RMSNorm(' + p.kvRank + ')');
+        addInit('self.W_kv_up_' + id + ' = nn.Linear(' + p.kvRank + ', n_heads * (' + p.nope + ' + ' + p.vDim + '), bias=False)');
+        add('# Multi-head Latent Attention: low-rank q / kv, decoupled RoPE');
+        const qsrc = p.qRank > 0 ? 'self.W_q_up_' + id + '(self.q_norm_' + id + '(self.W_q_down_' + id + '(' + p.src + ')))' : 'self.W_q_' + id + '(' + p.src + ')';
+        add(p.outQ + ' = ' + qsrc + '.view(B, T, H, ' + dq + ').transpose(1, 2)');
+        add('q_nope, q_pe = ' + p.outQ + '.split([' + p.nope + ', ' + p.rope + '], dim=-1)');
+        add('c_kv, k_pe = self.W_kv_down_' + id + '(' + p.src + ').split([' + p.kvRank + ', ' + p.rope + '], dim=-1)');
+        add('kv = self.W_kv_up_' + id + '(self.kv_norm_' + id + '(c_kv)).view(B, T, H, ' + p.nope + ' + ' + p.vDim + ').transpose(1, 2)');
+        add('k_nope, ' + p.outV + ' = kv.split([' + p.nope + ', ' + p.vDim + '], dim=-1)');
+        add('q_pe = apply_rope(q_pe, base=' + Number(p.base).toFixed(1) + ')');
+        add('k_pe = apply_rope(k_pe.unsqueeze(1), base=' + Number(p.base).toFixed(1) + ')  # shared across heads');
+        add(p.outQ + ' = torch.cat([q_nope, q_pe], dim=-1)  # [B, H, T, ' + dq + ']');
+        add(p.outK + ' = torch.cat([k_nope, k_pe.expand(-1, H, -1, -1)], dim=-1)  # [B, H, T, ' + dq + ']');
+        break;
+      }
       case 'rope':
         helpers.add('rope');
         add(p.target + ' = apply_rope(' + p.target + ', base=' + Number(p.base).toFixed(1) + ')');
@@ -370,7 +447,8 @@ export function generateCode(program, analysis) {
           kName = p.k + '_rep';
           add(kName + ' = repeat_kv(' + p.k + ', H // Hkv)');
         }
-        const scale = p.scale === 'sqrt' ? ' / math.sqrt(Dh)' : '';
+        const qd = info.ins[0] && info.ins[0].shape ? info.ins[0].shape[3] : 'Dh';
+        const scale = p.scale === 'sqrt' ? ' / math.sqrt(' + (typeof qd === 'number' ? qd : 'Dh') + ')' : '';
         if (p.kind === 'cosine') {
           add(p.out + ' = (F.normalize(' + p.q + ', dim=-1) @ F.normalize(' + kName + ', dim=-1).transpose(-2, -1))' + scale + shapeC(info));
         } else {
@@ -419,8 +497,10 @@ export function generateCode(program, analysis) {
       }
       case 'outproj': {
         const a = attr('W_o', b.id);
-        addInit('self.' + a + ' = nn.Linear(d_model, d_model, bias=False)');
-        add(p.out + ' = self.' + a + '(' + p.src + '.transpose(1, 2).reshape(B, T, D))' + shapeC(info));
+        const vd = info.ins[0] && info.ins[0].shape ? info.ins[0].shape[3] : 'Dh';
+        const inner = typeof vd === 'number' ? 'n_heads * ' + vd : 'n_heads * self.Dh';
+        addInit('self.' + a + ' = nn.Linear(' + inner + ', d_model, bias=False)');
+        add(p.out + ' = self.' + a + '(' + p.src + '.transpose(1, 2).reshape(B, T, H * ' + (typeof vd === 'number' ? vd : 'Dh') + '))' + shapeC(info));
         break;
       }
       case 'ret':
@@ -443,11 +523,12 @@ export function generateCode(program, analysis) {
   });
   if (!helpers.size) push('');
   push('class CustomAttention(nn.Module):');
-  push('    def __init__(self, d_model=' + cfg.D + ', n_heads=' + cfg.H + ', n_kv_heads=' + cfg.Hkv + '):');
+  const explicitDh = cfg.Dh > 0;
+  push('    def __init__(self, d_model=' + cfg.D + ', n_heads=' + cfg.H + ', n_kv_heads=' + cfg.Hkv + (explicitDh ? ', head_dim=' + cfg.Dh : '') + '):');
   push('        super().__init__()');
-  push('        assert d_model % n_heads == 0 and n_heads % n_kv_heads == 0');
+  push(explicitDh ? '        assert n_heads % n_kv_heads == 0  # head_dim is set explicitly (head_dim * n_heads != d_model is fine)' : '        assert d_model % n_heads == 0 and n_heads % n_kv_heads == 0');
   push('        self.D, self.H, self.Hkv = d_model, n_heads, n_kv_heads');
-  push('        self.Dh = d_model // n_heads');
+  push(explicitDh ? '        self.Dh = head_dim' : '        self.Dh = d_model // n_heads');
   init.forEach((l) => push('        ' + l.text, l.blockId));
   push('');
   push('    def forward(self, x):');

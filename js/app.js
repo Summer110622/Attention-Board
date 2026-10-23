@@ -1,4 +1,4 @@
-import { BLOCKS, CATEGORIES, PALETTE, DEFAULT_CONFIG, analyze, generateCode, newBlock, fmtShape } from './blocks.js';
+import { BLOCKS, CATEGORIES, PALETTE, DEFAULT_CONFIG, analyze, generateCode, newBlock, fmtShape, effDh } from './blocks.js';
 import { TEMPLATES } from './templates.js';
 import { evaluate, attentionStats, isAttentionMap } from './tensor.js';
 import { fetchHfConfig, configToSpec, specToProgram, formatParams } from './hf.js';
@@ -469,7 +469,7 @@ function renderProps() {
 function configFields() {
   const cfg = state.program.config;
   return h('div', { class: 'sec' }, ...Object.keys(DEFAULT_CONFIG).map((k) => h('label', { class: 'field' }, h('span', {}, t('cfg.' + k)),
-    h('input', { type: 'number', min: 1, step: 1, value: cfg[k], 'aria-label': t('cfg.' + k), onchange: (e) => { const n = Math.floor(Number(e.target.value)); if (n >= 1) commit((p) => { p.config[k] = n; }); else renderInspector(); } }))));
+    h('input', { type: 'number', min: k === 'Dh' ? 0 : 1, step: 1, value: cfg[k], 'aria-label': t('cfg.' + k), onchange: (e) => { const n = Math.floor(Number(e.target.value)); if (n >= (k === 'Dh' ? 0 : 1)) commit((p) => { p.config[k] = n; }); else renderInspector(); } }))));
 }
 
 function renderCode() {
@@ -488,7 +488,7 @@ function renderCode() {
 
 function renderShapes() {
   add(els.inspBody, 
-    h('p', { class: 'muted' }, 'B=' + state.program.config.B + ' · T=' + state.program.config.T + ' · D=' + state.program.config.D + ' · H=' + state.program.config.H + ' · h_kv=' + state.program.config.Hkv + ' · Dh=' + (state.program.config.D / state.program.config.H)),
+    h('p', { class: 'muted' }, 'B=' + state.program.config.B + ' · T=' + state.program.config.T + ' · D=' + state.program.config.D + ' · H=' + state.program.config.H + ' · h_kv=' + state.program.config.Hkv + ' · Dh=' + effDh(state.program.config)),
     h('div', { class: 'shape-table' }, analysis.tensors.map((x) => h('div', { class: 'shape-row' + (x.blockId === state.selId ? ' sel' : '') },
       h('span', { class: 'nm' }, x.name), h('span', { class: 'sh' }, fmtShape(x.shape))))),
     analysis.errors.length ? errList(analysis.errors) : null);
@@ -569,13 +569,13 @@ function renderStatus() {
   const errCount = analysis.errors.length;
   const cfg = state.program.config;
   const field = (k) => h('label', { class: 'cfg' }, k, h('input', {
-    type: 'number', min: 1, step: 1, value: cfg[k], 'aria-label': t('cfg.' + k),
-    onchange: (e) => { const n = Math.floor(Number(e.target.value)); if (n >= 1) commit((p) => { p.config[k] = n; }); else renderStatus(); }
+    type: 'number', min: k === 'Dh' ? 0 : 1, step: 1, value: cfg[k], 'aria-label': t('cfg.' + k), title: t('cfg.' + k),
+    onchange: (e) => { const n = Math.floor(Number(e.target.value)); if (n >= (k === 'Dh' ? 0 : 1)) commit((p) => { p.config[k] = n; }); else renderStatus(); }
   }));
   els.status.replaceChildren(
     errCount ? h('span', { class: 'bad' }, h('span', { class: 'dotc' }), t('status.err', { n: errCount }))
       : h('span', { class: 'ok' }, h('span', { class: 'dotc' }), t('status.ok')),
-    field('B'), field('T'), field('D'), field('H'), field('Hkv'),
+    field('B'), field('T'), field('D'), field('H'), field('Hkv'), field('Dh'),
     h('span', { class: 'spacer' }),
     h('span', {}, t('status.attn', { n: analysis.attnEntries.toLocaleString('en-US') })),
     h('span', {}, t('status.params', { n: analysis.params >= 1e6 ? (analysis.params / 1e6).toFixed(2) + 'M' : analysis.params.toLocaleString('en-US') })));
@@ -595,7 +595,7 @@ function openHf() {
 function applySpec(spec) {
   state.hf.spec = spec;
   state.hf.error = null;
-  state.hf.note = Math.abs(spec.headDim * spec.heads - spec.hidden) > 0.5 ? 'hf.dimnote' : null;
+  state.hf.note = null;
 }
 
 async function hfFetch() {
@@ -645,8 +645,17 @@ function renderHf() {
   if (s) {
     const fig = modelDiagram(s);
     state.hf.figure = fig;
-    const attn = s.attnKind === 'MLA' ? 'MLA' : s.attnKind + ' (h=' + s.heads + (s.attnKind !== 'MHA' ? ', h_kv=' + s.kvHeads : '') + ', d_h=' + Math.round(s.headDim) + ')';
-    const ffn = s.ffnType === 'moe' ? 'MoE (E=' + s.experts + (s.topK ? ', top-' + s.topK : '') + ')' : (s.ffnType === 'gated' ? 'Gated ' : '') + s.act + ', d_ff=' + s.ffn.toLocaleString('en-US');
+    const unk = t('hf.unknown');
+    const attn = s.attnKind === 'MLA'
+      ? 'MLA (h=' + s.heads + ', r_q=' + (s.mla.qLoraRank || '—') + ', r_kv=' + s.mla.kvLoraRank + (s.mla.qkNope != null ? ', d_nope=' + s.mla.qkNope + ', d_rope=' + s.mla.qkRope : '') + ')'
+      : s.attnKind + ' (h=' + s.heads + (s.attnKind !== 'MHA' ? ', h_kv=' + s.kvHeads : '') + ', d_h=' + Math.round(s.headDim) + ')';
+    const ffnW = s.ffn == null ? unk : s.ffn.toLocaleString('en-US');
+    const ffn = s.ffnType === 'moe' ? 'MoE (E=' + s.experts + ', top-' + (s.topK || unk) + (s.shared ? ', shared=' + s.shared : '') + ', d_ff=' + ffnW + ')' : (s.ffnType === 'gated' ? 'Gated ' : '') + s.act + ', d_ff=' + ffnW;
+    const hy = s.hybrid;
+    const kinds = hy ? [hy.linear ? t('hf.hybrid', { linear: hy.linear + ' ' + hy.linearName, full: hy.full }) : t('hf.hybrid.sliding', { sliding: hy.sliding, full: hy.full })].join('') : null;
+    const posTxt = s.pos === 'unknown' ? unk : s.pos + (s.ropeTheta ? ' (θ=' + s.ropeTheta.toLocaleString('en-US') + ')' : '');
+    const normTxt = s.norm === 'unknown' ? unk : (s.norm === 'rms' ? 'RMSNorm' : 'LayerNorm') + ', ' + s.placement + '-norm';
+    const unkNames = (s.unknown || []).map((u) => t('hf.unk.' + u)).join(', ');
     const dl = (k, v) => [h('div', {}, h('dt', {}, t('hf.field.' + k)), h('dd', {}, v))];
     const figBox = h('div', { class: 'fig-box' });
     figBox.innerHTML = fig.svg;
@@ -656,9 +665,11 @@ function renderHf() {
         ...dl('arch', s.arch || s.modelType || '—'), ...dl('family', t('hf.family.' + s.family)),
         ...dl('layers', s.family === 'encdec' ? s.encLayers + ' + ' + s.decLayers : String(s.layers)),
         ...dl('hidden', s.hidden.toLocaleString('en-US')), ...dl('heads', attn), ...dl('ffn', ffn),
-        ...dl('norm', (s.norm === 'rms' ? 'RMSNorm' : 'LayerNorm') + ', ' + s.placement + '-norm'), ...dl('pos', s.pos + (s.ropeTheta ? ' (θ=' + s.ropeTheta.toLocaleString('en-US') + ')' : '')),
-        ...dl('vocab', s.vocab ? s.vocab.toLocaleString('en-US') : '—'), ...dl('params', '≈ ' + formatParams(s.params))),
-      state.hf.note ? h('div', { class: 'msg-info' }, t(state.hf.note)) : null,
+        ...(kinds ? dl('layerkinds', kinds) : []), ...(s.denseLayers ? dl('dense', s.denseLayers + (s.denseFfn ? ' (d_ff=' + s.denseFfn.toLocaleString('en-US') + ')' : '')) : []),
+        ...dl('norm', normTxt), ...dl('pos', posTxt),
+        ...dl('vocab', s.vocab ? s.vocab.toLocaleString('en-US') : '—'), ...dl('params', s.params ? '≈ ' + formatParams(s.params) : unk)),
+      ...(s.notes || []).map((n) => h('div', { class: 'msg-info' }, t(n.key, n.args))),
+      unkNames ? h('div', { class: 'msg-info' }, t('hf.unknown_list', { list: unkNames })) : null,
       h('div', { class: 'row' },
         h('button', { class: 'btn small primary', onclick: () => downloadFigure({ ...fig }, s.name + '-architecture', 'png') }, icon('image', 14), t('btn.png')),
         h('button', { class: 'btn small', onclick: () => downloadFigure({ ...fig }, s.name + '-architecture', 'svg') }, icon('download', 14), t('btn.svg')),

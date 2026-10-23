@@ -71,7 +71,7 @@ Add an entry to `BLOCKS` in `js/blocks.js` (`defaults`, `fields`, `parts`, `chec
 ## Notes and limitations
 
 - The preview uses random weights and reduced sizes (`T ≤ 16`, `H ≤ 4`, `d_h = 4`); it shows the *structure* of an attention pattern, not trained behaviour. Custom blocks cannot run in the browser.
-- The model figure infers norm placement, FFN type and the positional scheme from `config.json` fields. These heuristics cover common families (Llama/Mistral/Qwen/Gemma/Phi, GPT-2/NeoX, BERT-like, T5/BART, Mixtral/DeepSeek) but can differ from the reference implementation. The parameter count is an estimate.
+- The model figure infers norm placement, FFN type and the positional scheme from `config.json` fields. These heuristics cover common families (Llama/Mistral/Qwen/Gemma/Phi, GPT-2/NeoX, BERT-like, T5/BART, Mixtral/DeepSeek) but can differ from the reference implementation. Anything that cannot be read from `config.json` (positional scheme, norm type, FFN width, experts per token, …) is shown as **unknown** instead of being guessed. Hybrid stacks (e.g. linear-attention + full-attention layers via `linear_attn_config` / `layer_types`) and dense-first MoE layers (`first_k_dense_replace`) are labelled in the figure, but linear-attention internals and MTP layers are not drawn. `d_model` always comes from `hidden_size`; MLA models (`kv_lora_rank`, …) load as an MLA block with low-rank Q/KV and decoupled RoPE. The parameter count is an estimate and is omitted when it cannot be computed.
 - Gated/private models: paste `config.json` into the dialog instead.
 - Drag & drop uses the HTML5 API (mouse). On touch devices use click-to-append and the arrow buttons.
 

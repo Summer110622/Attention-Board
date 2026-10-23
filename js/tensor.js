@@ -114,6 +114,42 @@ export function evaluate(program, analysis, seed = 7) {
         });
         break;
       }
+      case 'mla': {
+        const x = get(p.src);
+        const nope = 4, rope = 2, vd = 4, dq = nope + rope;
+        const rq = Math.max(1, Math.min(p.qRank || 4, 4)), rkv = Math.max(1, Math.min(p.kvRank, 4));
+        const q = p.qRank > 0
+          ? matmulRows(matmulRows(x.data, T, D, randomMatrix(rng, D, rq), rq), T, rq, randomMatrix(rng, rq, H * dq), H * dq)
+          : matmulRows(x.data, T, D, randomMatrix(rng, D, H * dq), H * dq);
+        const down = matmulRows(x.data, T, D, randomMatrix(rng, D, rkv + rope), rkv + rope);
+        const ckv = new Float32Array(T * rkv), kpe = new Float32Array(T * rope);
+        for (let t = 0; t < T; t++) {
+          for (let j = 0; j < rkv; j++) ckv[t * rkv + j] = down[t * (rkv + rope) + j];
+          for (let j = 0; j < rope; j++) kpe[t * rope + j] = down[t * (rkv + rope) + rkv + j];
+        }
+        const kv = matmulRows(ckv, T, rkv, randomMatrix(rng, rkv, H * (nope + vd)), H * (nope + vd));
+        const rot = (arr, o, t) => {
+          const half = rope / 2;
+          for (let j = 0; j < half; j++) {
+            const ang = t * Math.pow(p.base, -j / half), c = Math.cos(ang), s2 = Math.sin(ang);
+            const x1 = arr[o + j], x2 = arr[o + half + j];
+            arr[o + j] = x1 * c - x2 * s2; arr[o + half + j] = x2 * c + x1 * s2;
+          }
+        };
+        for (let t = 0; t < T; t++) rot(kpe, t * rope, t);
+        const qo = make([H, T, dq]), ko = make([H, T, dq]), vo = make([H, T, vd]);
+        for (let h = 0; h < H; h++) for (let t = 0; t < T; t++) {
+          const dst = (h * T + t) * dq;
+          for (let d = 0; d < dq; d++) qo.data[dst + d] = q[t * H * dq + h * dq + d];
+          rot(qo.data, dst + nope, t);
+          for (let d = 0; d < nope; d++) ko.data[dst + d] = kv[t * H * (nope + vd) + h * (nope + vd) + d];
+          for (let d = 0; d < rope; d++) ko.data[dst + nope + d] = kpe[t * rope + d];
+          for (let d = 0; d < vd; d++) vo.data[(h * T + t) * vd + d] = kv[t * H * (nope + vd) + h * (nope + vd) + nope + d];
+        }
+        env.set(p.outQ, qo); env.set(p.outK, ko); env.set(p.outV, vo);
+        outputs[b.id] = qo;
+        break;
+      }
       case 'rope': {
         const x = get(p.target);
         const [h, , dh] = x.shape;
@@ -134,15 +170,16 @@ export function evaluate(program, analysis, seed = 7) {
         const hk = k.shape[0];
         const rep = H / hk;
         out = make([H, T, T]);
-        const norm = (arr, o) => { let n = 0; for (let d = 0; d < Dh; d++) n += arr[o + d] * arr[o + d]; return Math.sqrt(n) || 1; };
+        const dq = q.shape[2];
+        const norm = (arr, o) => { let n = 0; for (let d = 0; d < dq; d++) n += arr[o + d] * arr[o + d]; return Math.sqrt(n) || 1; };
         for (let h = 0; h < H; h++) {
           const kh = Math.floor(h / rep);
           for (let i = 0; i < T; i++) for (let j = 0; j < T; j++) {
             let s = 0;
-            const qo = (h * T + i) * Dh, ko = (kh * T + j) * Dh;
-            for (let d = 0; d < Dh; d++) s += q.data[qo + d] * k.data[ko + d];
+            const qo = (h * T + i) * dq, ko = (kh * T + j) * dq;
+            for (let d = 0; d < dq; d++) s += q.data[qo + d] * k.data[ko + d];
             if (p.kind === 'cosine') s /= norm(q.data, qo) * norm(k.data, ko);
-            if (p.scale === 'sqrt') s /= Math.sqrt(Dh);
+            if (p.scale === 'sqrt') s /= Math.sqrt(dq);
             out.data[(h * T + i) * T + j] = s;
           }
         }
@@ -191,22 +228,24 @@ export function evaluate(program, analysis, seed = 7) {
       case 'mix': {
         const a = get(p.a), v = get(p.v);
         const rep = H / v.shape[0];
-        out = make([H, T, Dh]);
+        const dv = v.shape[2];
+        out = make([H, T, dv]);
         for (let h = 0; h < H; h++) {
           const vh = Math.floor(h / rep);
           for (let i = 0; i < T; i++) for (let j = 0; j < T; j++) {
             const w = a.data[(h * T + i) * T + j];
             if (w === 0) continue;
-            for (let d = 0; d < Dh; d++) out.data[(h * T + i) * Dh + d] += w * v.data[(vh * T + j) * Dh + d];
+            for (let d = 0; d < dv; d++) out.data[(h * T + i) * dv + d] += w * v.data[(vh * T + j) * dv + d];
           }
         }
         break;
       }
       case 'outproj': {
         const o = get(p.src);
-        const cat = new Float32Array(T * D);
-        for (let h = 0; h < H; h++) for (let t = 0; t < T; t++) for (let d = 0; d < Dh; d++) cat[t * D + h * Dh + d] = o.data[(h * T + t) * Dh + d];
-        out = { shape: [T, D], data: matmulRows(cat, T, D, randomMatrix(rng, D, D), D) };
+        const dv = o.shape[2], inner = H * dv;
+        const cat = new Float32Array(T * inner);
+        for (let h = 0; h < H; h++) for (let t = 0; t < T; t++) for (let d = 0; d < dv; d++) cat[t * inner + h * dv + d] = o.data[(h * T + t) * dv + d];
+        out = { shape: [T, D], data: matmulRows(cat, T, inner, randomMatrix(rng, inner, D), D) };
         break;
       }
       case 'ret':
