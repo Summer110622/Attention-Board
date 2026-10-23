@@ -1,0 +1,12 @@
+{
+  "name": "attention-board",
+  "version": "0.1.0",
+  "description": "Block-based playground for designing new attention mechanisms (PyTorch codegen, shape checking, paper-style figures).",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "test": "node tests/run.mjs",
+    "serve": "python3 -m http.server 8000"
+  }
+}
